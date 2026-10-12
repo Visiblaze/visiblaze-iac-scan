@@ -1,0 +1,41 @@
+Visiblaze IaC scan
+Copyright 2026 Visiblaze
+
+This product includes software developed at Visiblaze (https://visiblaze.com).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full terms.
+
+This licence covers the contents of this repository — the composite action and
+its pin manifest. It does not grant any right to the Visiblaze platform or its
+APIs, which are provided under a separate commercial agreement.
+
+
+THIRD-PARTY SOFTWARE
+--------------------
+
+Nothing is downloaded from a third party at run time.
+
+This action downloads and executes exactly one archive, ours, verified against a
+digest pinned in pins.env before anything in it runs. It fetches nothing else,
+from anyone.
+
+That archive BUNDLES Trivy, and the scanner EXECUTES it. This differs from the
+other Visiblaze actions, which only adapt rules from it:
+
+Trivy - https://github.com/aquasecurity/trivy
+    Copyright Aqua Security Software Ltd.
+    Licensed under the Apache License, Version 2.0.
+
+    The release archive contains the Trivy binary and its Rego policy bundle.
+    `visiblaze-iac` invokes Trivy to evaluate infrastructure files and then
+    normalises its report. Trivy is shipped inside our archive rather than
+    fetched separately so that one digest covers everything that executes, and
+    so that a scan never depends on a registry being reachable.
+
+    Trivy's output is NOT forwarded. Its report carries the offending source
+    lines verbatim; the normalisation step reads them on your runner to derive
+    the resource address and discards them. See SECURITY.md.
+
+    A copy of the Apache License, Version 2.0 is in LICENSE, which is the same
+    licence Trivy is distributed under.

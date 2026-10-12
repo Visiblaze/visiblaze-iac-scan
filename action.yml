@@ -1,0 +1,320 @@
+# visiblaze-iac-scan — infrastructure-as-code scanning, on your runner.
+#
+# ── What leaves your runner ──
+#
+# Findings and declarations. Never your code.
+#
+# That distinction is enforced rather than promised. Trivy's own report carries the offending
+# source verbatim, at Results[].Misconfigurations[].CauseMeta.Code.Lines[].Content, so this action
+# does NOT forward it. The scanner normalises on this machine into a shape with no field for file
+# content: a rule id, a severity, a path, a line, a resource address. The source is read here, used
+# to derive that address, and left behind.
+#
+# ── Why a runner and not our servers ──
+#
+# Because the alternative is handing us your repository. Infrastructure code carries account ids,
+# bucket names, network topology and IAM policy; a promise not to keep it is weaker than never
+# receiving it.
+#
+# ── What this action cannot do yet ──
+#
+# Send. There is no ingest route for infrastructure findings -- see pins.env. `dry-run: true` is
+# the only mode that completes today, and it is genuinely useful: it scans, builds the payload,
+# validates it and prints what would be sent.
+name: Visiblaze IaC scan
+description: Scan infrastructure code on your own runner. Findings and locations are sent; source never is.
+branding:
+  icon: layers
+  color: blue
+
+inputs:
+  tenant:
+    description: Your Visiblaze tenant id. Required — a scan filed against the wrong tenant is not recoverable by re-running.
+    required: true
+  api-url:
+    description: >-
+      The ingest endpoint Visiblaze gave you. Checked against the allowlist in pins.env; an
+      action that posts wherever it is told is an exfiltration primitive, not a security tool.
+    required: false
+    default: ""
+  repo-key:
+    description: 'Visiblaze repository key ("github#<numeric id>"). Defaults to this repository.'
+    required: false
+    default: ""
+  path:
+    description: Directory to scan, relative to the workspace. The whole checkout by default.
+    required: false
+    default: "."
+  fail-on:
+    description: >-
+      Fail the job when a finding at or above this severity is present: critical, high, medium or
+      low. Empty means report only, which is the right default for a check nobody is gating on yet.
+    required: false
+    default: ""
+  timeout:
+    description: >-
+      Overall scan budget. MEASURED: this repository's own infra/ tree takes ~5m35s, and a 6m
+      budget timed out on one of two runs — so the default has deliberate headroom.
+    required: false
+    default: "14m"
+  fail-on-error:
+    description: >-
+      Whether OUR failure breaks your build. Defaults to false: a scanner outage must not be the
+      reason your pipeline goes red. It does not govern `fail-on`, which is your own result.
+    required: false
+    default: "false"
+  dry-run:
+    description: Scan and report what would be sent, upload nothing. Currently the only mode that completes.
+    required: false
+    default: "false"
+
+outputs:
+  findings:
+    description: Number of findings in the payload.
+    value: ${{ steps.scan.outputs.findings }}
+  declarations:
+    description: Number of resource declarations located.
+    value: ${{ steps.scan.outputs.declarations }}
+  complete:
+    description: >-
+      Whether the scan read everything it was pointed at. FALSE with zero findings is not a clean
+      repository, and a consumer that treats the two alike will report an all-clear for a scan
+      that never finished.
+    value: ${{ steps.scan.outputs.complete }}
+  status:
+    description: One of complete, failed, skipped-no-infrastructure.
+    value: ${{ steps.scan.outputs.status }}
+
+runs:
+  using: composite
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        IN_TENANT: ${{ inputs.tenant }}
+        IN_API_URL: ${{ inputs.api-url }}
+        IN_REPO_KEY: ${{ inputs.repo-key }}
+        IN_PATH: ${{ inputs.path }}
+        IN_FAIL_ON: ${{ inputs.fail-on }}
+        IN_TIMEOUT: ${{ inputs.timeout }}
+        IN_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        IN_DRY_RUN: ${{ inputs.dry-run }}
+        GH_REPOSITORY: ${{ github.repository }}
+        GH_REPOSITORY_ID: ${{ github.repository_id }}
+        GH_REF_NAME: ${{ github.ref_name }}
+        GH_SHA: ${{ github.sha }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -uo pipefail
+
+        # bail reports and then decides whether to break the build. Every one of OUR failures goes
+        # through here so that fail-on-error governs all of them uniformly; a path that exits
+        # directly is a path that ignores the input the customer set.
+        STATUS="failed"
+        bail() {
+          local level="$1"; shift
+          echo "::${level}::visiblaze-iac: $*"
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+          printf 'findings=\ndeclarations=\ncomplete=false\n' >> "$GITHUB_OUTPUT"
+          if [ "${IN_FAIL_ON_ERROR}" = "true" ]; then exit 1; fi
+          exit 0
+        }
+
+        # ── Booleans, validated ─────────────────────────────────────────────────────────
+        #
+        # An unrecognised value is refused rather than silently read as false. "yes" meaning
+        # "no" is the kind of thing nobody notices until the run that mattered.
+        for v in IN_FAIL_ON_ERROR IN_DRY_RUN; do
+          case "${!v}" in
+            true|false) ;;
+            *) bail error "${v#IN_} must be 'true' or 'false', got '${!v}'" ;;
+          esac
+        done
+
+        [ -n "${IN_TENANT}" ] || bail error "tenant is required — a scan filed against no tenant is discarded"
+
+        # ── The caller's inputs are checked BEFORE anything is fetched ───────────────────
+        #
+        # Order matters and was got wrong first: with the pins check ahead of these, a bad path or
+        # a disallowed origin was reported as "no pinned release", and neither guard could be
+        # exercised at all until a release existed. A security control that has never run is not a
+        # control. Cheap checks first also means the common mistakes get the accurate message.
+
+        # ── The API origin ──────────────────────────────────────────────────────────────
+        if [ "${IN_DRY_RUN}" != "true" ]; then
+          if [ -z "${ALLOWED_API_ORIGINS:-}" ]; then
+            bail error "there is no ingest route for infrastructure findings yet, so this scan cannot be sent. Run with dry-run: true, which scans and reports without sending."
+          fi
+          [ -n "${IN_API_URL}" ] || bail error "api-url is required — use the ingest endpoint Visiblaze gave you"
+          origin="$(printf '%s' "${IN_API_URL}" | sed -E 's#^(https://[^/]+).*#\1#')"
+          case " ${ALLOWED_API_ORIGINS} " in
+            *" ${origin} "*) ;;
+            *) bail error "api-url origin ${origin} is not one this action is allowed to post to" ;;
+          esac
+        fi
+
+        # ── The scan path must stay inside the checkout ─────────────────────────────────
+        #
+        # Resolved and compared, not pattern-matched: `../` is not the only way out, and a
+        # symlink is not visible in the string at all.
+        WS="$(pwd -P)"
+        TARGET="$(cd "${IN_PATH}" 2>/dev/null && pwd -P)" \
+          || bail error "path '${IN_PATH}' does not exist in the checkout"
+        case "${TARGET}" in
+          "${WS}"|"${WS}"/*) ;;
+          *) bail error "path '${IN_PATH}' resolves outside the checkout" ;;
+        esac
+
+        # ── Pins ────────────────────────────────────────────────────────────────────────
+        PINS="${ACTION_DIR}/pins.env"
+        [ -f "$PINS" ] || bail error "pins.env is missing from the action — refusing to fetch anything unpinned"
+        # shellcheck disable=SC1090
+        . "$PINS"
+
+        if [ -z "${SCANNER_VERSION:-}" ] || [ -z "${SCANNER_SHA256_LINUX_AMD64:-}" ]; then
+          STATUS="failed"
+          bail error "this action has no pinned scanner release yet, so there is nothing it can verify and run. See pins.env."
+        fi
+
+        case "$(uname -s)" in
+          Linux) ;;
+          *) bail error "unsupported runner OS $(uname -s); Visiblaze publishes Linux builds only" ;;
+        esac
+
+        REPO_KEY="${IN_REPO_KEY}"
+        [ -n "${REPO_KEY}" ] || REPO_KEY="github#${GH_REPOSITORY_ID}"
+
+        echo "::notice::visiblaze-iac: this action does not upload your source. Findings carry a path and a line; file contents are read on this runner and left here."
+
+        # ── Fetch and verify ────────────────────────────────────────────────────────────
+        WORK="$(mktemp -d)"
+        trap 'rm -rf "${WORK}"' EXIT
+
+        verify() {
+          local file="$1" want="$2" actual
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "$file" | awk '{print $1}')"
+          elif command -v shasum >/dev/null 2>&1; then
+            actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+          else
+            bail error "no sha256sum or shasum on this runner — cannot verify a download, so nothing will be executed"
+          fi
+          [ "$actual" = "$want" ] || bail error "digest mismatch on $(basename "$file"): expected ${want}, got ${actual}. Nothing was executed."
+        }
+
+        # ONE artefact, ONE digest. Trivy and its Rego checks ship inside our release tarball
+        # rather than being fetched separately, so this digest covers all three. Two downloads
+        # would mean two things to verify and one more URL to be wrong about; shellcheck caught
+        # the first draft assigning a Trivy digest it then never checked, which is exactly the
+        # shape of a supply-chain gap that reads as covered.
+        case "$(uname -m)" in
+          x86_64)  ARCH=amd64; SCANNER_WANT="${SCANNER_SHA256_LINUX_AMD64}" ;;
+          aarch64) ARCH=arm64; SCANNER_WANT="${SCANNER_SHA256_LINUX_ARM64}" ;;
+          *) bail error "unsupported runner architecture $(uname -m)" ;;
+        esac
+
+        TGZ="visiblaze-iac_${SCANNER_VERSION}_linux_${ARCH}.tar.gz"
+        curl -fsSL --retry 3 -o "${WORK}/${TGZ}" "${SCANNER_BASE_URL}/${SCANNER_VERSION}/${TGZ}" \
+          || bail error "could not download ${TGZ}"
+        verify "${WORK}/${TGZ}" "${SCANNER_WANT}"
+        tar -xzf "${WORK}/${TGZ}" -C "${WORK}" || bail error "could not extract ${TGZ}"
+        chmod +x "${WORK}/visiblaze-iac" 2>/dev/null || true
+
+        # The Rego checks travel with the release, so a scan never depends on a registry being up.
+        [ -x "${WORK}/trivy" ] || bail error "the release carried no scanner engine; nothing was executed"
+        CHECKS_DIR="${WORK}/checks"
+        [ -d "${CHECKS_DIR}" ] || bail error "the release carried no checks bundle; a scan with no checks reports nothing and would look clean"
+
+        # ── Scan ────────────────────────────────────────────────────────────────────────
+        PAYLOAD="${WORK}/iac-payload.json"
+        set +e
+        "${WORK}/visiblaze-iac" scan \
+          --path "${IN_PATH}" \
+          --repo-root "${WS}" \
+          --repo-key "${REPO_KEY}" \
+          --repo-name "${GH_REPOSITORY}" \
+          --ref "${GH_REF_NAME}" \
+          --commit "${GH_SHA}" \
+          --trivy "${WORK}/trivy" \
+          --trivy-cache "${CHECKS_DIR}" \
+          --timeout "${IN_TIMEOUT}" \
+          --out "${PAYLOAD}"
+        rc=$?
+        set -e
+        [ "$rc" -eq 0 ] || bail error "the scan did not complete (exit ${rc})"
+
+        N_FIND=$(jq '.findings | length' "${PAYLOAD}")
+        N_DECL=$(jq '.declarations | length' "${PAYLOAD}")
+        COMPLETE=$(jq -r '.complete' "${PAYLOAD}")
+        STATUS="complete"
+
+        {
+          echo "findings=${N_FIND}"
+          echo "declarations=${N_DECL}"
+          echo "complete=${COMPLETE}"
+          echo "status=${STATUS}"
+        } >> "$GITHUB_OUTPUT"
+
+        # Reported whether or not it is about to be sent. A consumer that only learns the counts
+        # on a successful upload cannot report on the runs that matter.
+        {
+          echo "### Visiblaze — infrastructure scan"
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Findings | ${N_FIND} |"
+          echo "| Resources located | ${N_DECL} |"
+          echo "| Scan complete | ${COMPLETE} |"
+          if [ "${COMPLETE}" != "true" ]; then
+            echo ""
+            echo "> The scan did not read everything it was pointed at, so **no finding count here means clean**."
+          fi
+          jq -r '.notes // [] | .[] | "- \(.)"' "${PAYLOAD}"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        if [ "${IN_DRY_RUN}" = "true" ]; then
+          echo "::notice::visiblaze-iac: dry run — ${N_FIND} finding(s), ${N_DECL} resource(s) located, nothing sent"
+          jq -r '.findings[0:5][] | "  \(.severity)  \(.rule_id)  \(.path):\(.start_line)"' "${PAYLOAD}"
+          exit 0
+        fi
+
+        # ── Send ────────────────────────────────────────────────────────────────────────
+        #
+        # Unreachable today: the origin allowlist above is empty, so a non-dry run has already
+        # bailed. Written now, and left inert, so that the route landing is a pins.env change
+        # rather than a new code path nobody has read.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          bail error "no OIDC token available — add 'permissions: { id-token: write }' to this job"
+        fi
+        AUDIENCE="visiblaze-iac-findings"
+        OIDC=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" 2>/dev/null | jq -r '.value // empty')
+        [ -n "${OIDC}" ] || bail error "could not mint an OIDC token for ${AUDIENCE}"
+
+        BODY="${WORK}/response.json"
+        gzip -c "${PAYLOAD}" > "${WORK}/payload.gz"
+        code=$(curl -sS --fail-with-body -o "${BODY}" -w '%{http_code}' \
+          -X POST "${IN_API_URL}" \
+          -H "Authorization: Bearer ${OIDC}" \
+          -H "Content-Type: application/json" \
+          -H "Content-Encoding: gzip" \
+          -H "x-visiblaze-tenant: ${IN_TENANT}" \
+          --data-binary "@${WORK}/payload.gz") || true
+        case "${code}" in
+          2*) echo "::notice::visiblaze-iac: sent ${N_FIND} finding(s) and ${N_DECL} resource location(s)" ;;
+          *)  bail error "the ingest refused the upload (HTTP ${code}): $(head -c 300 "${BODY}" 2>/dev/null)" ;;
+        esac
+
+        # ── Your result, not ours ───────────────────────────────────────────────────────
+        #
+        # fail-on is the customer's policy and is reported as-is, regardless of fail-on-error,
+        # which governs only whether OUR failures break the build.
+        if [ -n "${IN_FAIL_ON}" ]; then
+          HIT=$(jq --arg t "${IN_FAIL_ON}" '
+            (["low","medium","high","critical"] | index($t)) as $ti
+            | [.findings[] | select((["low","medium","high","critical"] | index(.severity)) >= $ti)] | length' "${PAYLOAD}")
+          if [ "${HIT}" -gt 0 ]; then
+            echo "::error::visiblaze-iac: ${HIT} finding(s) at or above ${IN_FAIL_ON}"
+            exit 2
+          fi
+        fi
