@@ -16,11 +16,10 @@
 # bucket names, network topology and IAM policy; a promise not to keep it is weaker than never
 # receiving it.
 #
-# ── What this action cannot do yet ──
+# ── Pull requests ──
 #
-# Send. There is no ingest route for infrastructure findings -- see pins.env. `dry-run: true` is
-# the only mode that completes today, and it is genuinely useful: it scans, builds the payload,
-# validates it and prints what would be sent.
+# On a pull_request event this action scans and sends the merge base as well as the head, because the
+# platform's pull-request check compares the two by exact commit.
 name: Visiblaze IaC scan
 description: Scan infrastructure code on your own runner. Findings and locations are sent; source never is.
 branding:
@@ -64,7 +63,7 @@ inputs:
     required: false
     default: "false"
   dry-run:
-    description: Scan and report what would be sent, upload nothing. Currently the only mode that completes.
+    description: Scan and report what would be sent, upload nothing.
     required: false
     default: "false"
 
@@ -102,7 +101,15 @@ runs:
         GH_REPOSITORY: ${{ github.repository }}
         GH_REPOSITORY_ID: ${{ github.repository_id }}
         GH_REF_NAME: ${{ github.ref_name }}
-        GH_SHA: ${{ github.sha }}
+        # The pull request's HEAD, not github.sha: on a pull_request event github.sha is GitHub's
+        # synthetic merge commit, a sha the platform never looks up, so an upload filed under it is
+        # stored and then read by nothing.
+        GH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        # Set on pull_request events only. The check compares this run's head against an upload
+        # for the merge base, so a pull-request run scans and sends both.
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         ACTION_DIR: ${{ github.action_path }}
       run: |
         set -uo pipefail
@@ -139,11 +146,21 @@ runs:
         # a disallowed origin was reported as "no pinned release", and neither guard could be
         # exercised at all until a release existed. A security control that has never run is not a
         # control. Cheap checks first also means the common mistakes get the accurate message.
+        #
+        # pins.env is READ here, though, because the origin allowlist lives in it. Read after the
+        # origin check, as it first was, the check saw an unset variable on every run and refused
+        # every upload however the file was filled in. Sourcing it also overwrites any
+        # ALLOWED_API_ORIGINS the calling job set in its own env, so a workflow cannot widen the
+        # allowlist for itself. Whether the file names a release is still asked further down.
+        PINS="${ACTION_DIR}/pins.env"
+        [ -f "$PINS" ] || bail error "pins.env is missing from the action — refusing to fetch anything unpinned"
+        # shellcheck disable=SC1090
+        . "$PINS"
 
         # ── The API origin ──────────────────────────────────────────────────────────────
         if [ "${IN_DRY_RUN}" != "true" ]; then
           if [ -z "${ALLOWED_API_ORIGINS:-}" ]; then
-            bail error "there is no ingest route for infrastructure findings yet, so this scan cannot be sent. Run with dry-run: true, which scans and reports without sending."
+            bail error "pins.env allows no ingest origin, so this scan cannot be sent. Run with dry-run: true, which scans and reports without sending."
           fi
           [ -n "${IN_API_URL}" ] || bail error "api-url is required — use the ingest endpoint Visiblaze gave you"
           origin="$(printf '%s' "${IN_API_URL}" | sed -E 's#^(https://[^/]+).*#\1#')"
@@ -166,11 +183,6 @@ runs:
         esac
 
         # ── Pins ────────────────────────────────────────────────────────────────────────
-        PINS="${ACTION_DIR}/pins.env"
-        [ -f "$PINS" ] || bail error "pins.env is missing from the action — refusing to fetch anything unpinned"
-        # shellcheck disable=SC1090
-        . "$PINS"
-
         if [ -z "${SCANNER_VERSION:-}" ] || [ -z "${SCANNER_SHA256_LINUX_AMD64:-}" ]; then
           STATUS="failed"
           bail error "this action has no pinned scanner release yet, so there is nothing it can verify and run. See pins.env."
@@ -202,49 +214,114 @@ runs:
           [ "$actual" = "$want" ] || bail error "digest mismatch on $(basename "$file"): expected ${want}, got ${actual}. Nothing was executed."
         }
 
-        # ONE artefact, ONE digest. Trivy and its Rego checks ship inside our release tarball
+        # ONE artefact, ONE digest. Trivy and its Rego checks ship inside our release bundle
         # rather than being fetched separately, so this digest covers all three. Two downloads
         # would mean two things to verify and one more URL to be wrong about; shellcheck caught
         # the first draft assigning a Trivy digest it then never checked, which is exactly the
         # shape of a supply-chain gap that reads as covered.
+        #
+        # The BUNDLE, not visiblaze-iac_<v>_*.tar.gz. That archive is the scanner alone, which is
+        # what every other consumer of the binary wants; this action refused it at the engine check
+        # below (v0.1.1 measured: one file, no trivy, no checks).
         case "$(uname -m)" in
           x86_64)  ARCH=amd64; SCANNER_WANT="${SCANNER_SHA256_LINUX_AMD64}" ;;
           aarch64) ARCH=arm64; SCANNER_WANT="${SCANNER_SHA256_LINUX_ARM64}" ;;
           *) bail error "unsupported runner architecture $(uname -m)" ;;
         esac
+        [ -n "${SCANNER_WANT}" ] || bail error "pins.env names no digest for linux/${ARCH}, so nothing can be verified and run"
 
-        TGZ="visiblaze-iac_${SCANNER_VERSION}_linux_${ARCH}.tar.gz"
+        BUNDLE="${WORK}/bundle"
+        mkdir -p "${BUNDLE}"
+        TGZ="visiblaze-iac-bundle_${SCANNER_VERSION}_linux_${ARCH}.tar.gz"
         curl -fsSL --retry 3 -o "${WORK}/${TGZ}" "${SCANNER_BASE_URL}/${SCANNER_VERSION}/${TGZ}" \
           || bail error "could not download ${TGZ}"
         verify "${WORK}/${TGZ}" "${SCANNER_WANT}"
-        tar -xzf "${WORK}/${TGZ}" -C "${WORK}" || bail error "could not extract ${TGZ}"
-        chmod +x "${WORK}/visiblaze-iac" 2>/dev/null || true
+        tar -xzf "${WORK}/${TGZ}" -C "${BUNDLE}" || bail error "could not extract ${TGZ}"
 
         # The Rego checks travel with the release, so a scan never depends on a registry being up.
-        [ -x "${WORK}/trivy" ] || bail error "the release carried no scanner engine; nothing was executed"
-        CHECKS_DIR="${WORK}/checks"
-        [ -d "${CHECKS_DIR}" ] || bail error "the release carried no checks bundle; a scan with no checks reports nothing and would look clean"
+        [ -x "${BUNDLE}/visiblaze-iac" ] || bail error "the release carried no visiblaze-iac binary; nothing was executed"
+        [ -x "${BUNDLE}/trivy" ] || bail error "the release carried no scanner engine; nothing was executed"
+        CHECKS_DIR="${BUNDLE}/checks"
+        [ -d "${CHECKS_DIR}/policy" ] || bail error "the release carried no checks bundle; a scan with no checks reports nothing and would look clean"
+
+        # ── The merge base, on a pull request ───────────────────────────────────────────
+        #
+        # The pull-request check compares two uploads: one for the pull request's head and one for
+        # the merge base of (base tip, head), both looked up by exact commit. A run that sends only
+        # the head gives the check nothing to compare against, so every pull request reads "no
+        # baseline". The same resolution the SAST and secrets actions use, for the same reasons:
+        #
+        #   - the checkout is shallow (actions/checkout defaults to fetch-depth 1), so deepen it
+        #     here rather than asking the caller to change their checkout;
+        #   - merge-base the pull request's HEAD, never the checked-out HEAD: on a pull_request
+        #     event that is refs/pull/N/merge, whose first parent IS the base tip, so the answer
+        #     would be the base tip instead of the fork point.
+        #
+        # Not fatal. Without a merge base the head is still sent, and the check says it had no
+        # baseline, which is the truth.
+        REL="${TARGET#"${WS}"}"
+        REL="${REL#/}"
+        BASE_COMMIT=""
+        BASE_WT="${WORK}/base"
+        if [ -n "${BASE_SHA:-}" ] && [ "${IN_DRY_RUN}" != "true" ] && git -C "${WS}" rev-parse --git-dir >/dev/null 2>&1; then
+          git -C "${WS}" fetch --no-tags --quiet --depth=200 origin "+${BASE_SHA}:refs/visiblaze/base" 2>/dev/null \
+            || git -C "${WS}" fetch --no-tags --quiet --depth=200 origin "${BASE_REF}" 2>/dev/null || true
+          git -C "${WS}" fetch --no-tags --quiet --deepen=200 2>/dev/null || true
+          MB_HEAD="${PR_HEAD_SHA:-}"
+          [ -n "${MB_HEAD}" ] || MB_HEAD="$(git -C "${WS}" rev-parse --verify --quiet 'HEAD^2' 2>/dev/null || true)"
+          [ -n "${MB_HEAD}" ] || MB_HEAD="HEAD"
+          MERGE_BASE="$(git -C "${WS}" merge-base "${MB_HEAD}" "${BASE_SHA}" 2>/dev/null || true)"
+          if [ -n "${MERGE_BASE}" ] \
+             && git -C "${WS}" worktree add --detach --quiet "${BASE_WT}" "${MERGE_BASE}" 2>/dev/null; then
+            BASE_COMMIT="${MERGE_BASE}"
+            # The worktree is registered in the caller's repository; remove it there, not just its
+            # directory, or the checkout is left naming a path that no longer exists.
+            trap 'git -C "${WS}" worktree remove --force "${BASE_WT}" 2>/dev/null; rm -rf "${WORK}"' EXIT
+            echo "visiblaze-iac: comparing against merge base ${MERGE_BASE}"
+          else
+            echo "::warning::visiblaze-iac: could not resolve the merge base of ${MB_HEAD} and ${BASE_SHA}; sending the head only, so this pull request's check will report no baseline"
+          fi
+        fi
 
         # ── Scan ────────────────────────────────────────────────────────────────────────
+        #
+        # No `set -e` from here on. Everything below either goes through bail, so fail-on-error
+        # decides, or is the customer's own fail-on result. An unchecked non-zero exit would
+        # bypass both and fail the customer's job for a reason they did not opt into.
+        scan_tree() { # root commit out
+          local root="$1" commit="$2" out="$3" path="$1" rc
+          [ -z "${REL}" ] || path="$1/${REL}"
+          "${BUNDLE}/visiblaze-iac" scan \
+            --path "${path}" \
+            --repo-root "${root}" \
+            --repo-key "${REPO_KEY}" \
+            --repo-name "${GH_REPOSITORY}" \
+            --ref "${GH_REF_NAME}" \
+            --commit "${commit}" \
+            --trivy "${BUNDLE}/trivy" \
+            --trivy-cache "${CHECKS_DIR}" \
+            --timeout "${IN_TIMEOUT}" \
+            --out "${out}"
+          rc=$?
+          [ "$rc" -eq 0 ] || bail error "the scan of ${commit} did not complete (exit ${rc})"
+          jq -e '.findings | type == "array"' "${out}" >/dev/null 2>&1 \
+            || bail error "the scan of ${commit} wrote no readable payload"
+        }
+
         PAYLOAD="${WORK}/iac-payload.json"
-        set +e
-        "${WORK}/visiblaze-iac" scan \
-          --path "${IN_PATH}" \
-          --repo-root "${WS}" \
-          --repo-key "${REPO_KEY}" \
-          --repo-name "${GH_REPOSITORY}" \
-          --ref "${GH_REF_NAME}" \
-          --commit "${GH_SHA}" \
-          --trivy "${WORK}/trivy" \
-          --trivy-cache "${CHECKS_DIR}" \
-          --timeout "${IN_TIMEOUT}" \
-          --out "${PAYLOAD}"
-        rc=$?
-        set -e
-        [ "$rc" -eq 0 ] || bail error "the scan did not complete (exit ${rc})"
+        BASE_PAYLOAD="${WORK}/iac-payload-base.json"
+        if [ -n "${BASE_COMMIT}" ]; then
+          # The base tree may not have the scanned directory at all (the pull request adds it).
+          # That is a real, empty baseline, so scan the base root and let the payload say so.
+          if [ -n "${REL}" ] && [ ! -d "${BASE_WT}/${REL}" ]; then
+            mkdir -p "${BASE_WT}/${REL}"
+          fi
+          scan_tree "${BASE_WT}" "${BASE_COMMIT}" "${BASE_PAYLOAD}"
+        fi
+        scan_tree "${WS}" "${GH_SHA}" "${PAYLOAD}"
 
         N_FIND=$(jq '.findings | length' "${PAYLOAD}")
-        N_DECL=$(jq '.declarations | length' "${PAYLOAD}")
+        N_DECL=$(jq '.declarations // [] | length' "${PAYLOAD}")
         COMPLETE=$(jq -r '.complete' "${PAYLOAD}")
         STATUS="complete"
 
@@ -265,6 +342,9 @@ runs:
           echo "| Findings | ${N_FIND} |"
           echo "| Resources located | ${N_DECL} |"
           echo "| Scan complete | ${COMPLETE} |"
+          if [ -n "${BASE_COMMIT}" ]; then
+            echo "| Merge base | \`${BASE_COMMIT}\` ($(jq '.findings | length' "${BASE_PAYLOAD}") finding(s)) |"
+          fi
           if [ "${COMPLETE}" != "true" ]; then
             echo ""
             echo "> The scan did not read everything it was pointed at, so **no finding count here means clean**."
@@ -279,10 +359,6 @@ runs:
         fi
 
         # ── Send ────────────────────────────────────────────────────────────────────────
-        #
-        # Unreachable today: the origin allowlist above is empty, so a non-dry run has already
-        # bailed. Written now, and left inert, so that the route landing is a pins.env change
-        # rather than a new code path nobody has read.
         if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
           bail error "no OIDC token available — add 'permissions: { id-token: write }' to this job"
         fi
@@ -291,19 +367,25 @@ runs:
           "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" 2>/dev/null | jq -r '.value // empty')
         [ -n "${OIDC}" ] || bail error "could not mint an OIDC token for ${AUDIENCE}"
 
-        BODY="${WORK}/response.json"
-        gzip -c "${PAYLOAD}" > "${WORK}/payload.gz"
-        code=$(curl -sS --fail-with-body -o "${BODY}" -w '%{http_code}' \
-          -X POST "${IN_API_URL}" \
-          -H "Authorization: Bearer ${OIDC}" \
-          -H "Content-Type: application/json" \
-          -H "Content-Encoding: gzip" \
-          -H "x-visiblaze-tenant: ${IN_TENANT}" \
-          --data-binary "@${WORK}/payload.gz") || true
-        case "${code}" in
-          2*) echo "::notice::visiblaze-iac: sent ${N_FIND} finding(s) and ${N_DECL} resource location(s)" ;;
-          *)  bail error "the ingest refused the upload (HTTP ${code}): $(head -c 300 "${BODY}" 2>/dev/null)" ;;
-        esac
+        send() { # payload label
+          local body="${WORK}/response-$2.json" code
+          gzip -c "$1" > "${WORK}/payload-$2.gz"
+          code=$(curl -sS -o "${body}" -w '%{http_code}' \
+            -X POST "${IN_API_URL}" \
+            -H "Authorization: Bearer ${OIDC}" \
+            -H "Content-Type: application/json" \
+            -H "Content-Encoding: gzip" \
+            -H "x-visiblaze-tenant: ${IN_TENANT}" \
+            --data-binary "@${WORK}/payload-$2.gz") || true
+          case "${code}" in
+            2*) echo "::notice::visiblaze-iac: sent the $2 scan: $(jq '.findings | length' "$1") finding(s), $(jq '.declarations // [] | length' "$1") resource location(s)" ;;
+            *)  bail error "the ingest refused the $2 upload (HTTP ${code}): $(head -c 300 "${body}" 2>/dev/null)" ;;
+          esac
+        }
+        # Base first. Each upload re-queues the pull request's check, and the head's re-queue is
+        # the one that should find both sides already stored.
+        [ -z "${BASE_COMMIT}" ] || send "${BASE_PAYLOAD}" "merge-base"
+        send "${PAYLOAD}" "head"
 
         # ── Your result, not ours ───────────────────────────────────────────────────────
         #

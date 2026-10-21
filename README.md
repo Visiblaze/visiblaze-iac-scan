@@ -15,8 +15,7 @@ jobs:
       - uses: Visiblaze/visiblaze-iac-scan@<sha>
         with:
           tenant: your-tenant-id
-          api-url: https://…/v1/code/iac
-          dry-run: "true"       # currently the only mode that completes — see Status
+          api-url: https://…/v1/code/iac/findings
 ```
 
 ## What leaves your runner
@@ -67,13 +66,17 @@ together and are verified against a digest committed in `pins.env` before anythi
 substituted artefact fails the check rather than running. Nothing is fetched from a registry at
 scan time, so a registry outage cannot silently turn a scan into a no-op.
 
-## Status
+## Pull requests
 
-**Not yet shippable.** Two things are missing and both are ours, not yours:
+On a `pull_request` event the action scans two trees: the pull request's head and the merge base
+of (base tip, head). It uploads both, merge base first, because the platform's pull-request check
+compares the two by exact commit. Without the merge base it would have nothing to compare against.
+The checkout can stay shallow, because the action deepens it itself. If no merge base can be
+resolved, the head is still sent and the check reports that it had no baseline.
 
-- there is no released `visiblaze-iac` binary, so `pins.env` carries no digest and the action
-  refuses to run rather than fetch something unverified;
-- there is no ingest route for infrastructure findings, so a non-dry run has nowhere to post.
+## What it reads, measured
 
-`dry-run: true` works today and is genuinely useful: it scans, builds the payload, validates it,
-and prints what would be sent.
+The engine is Trivy's `config` scanner plus Visiblaze's own checks, so it covers every
+infrastructure format Trivy reads. On the Visiblaze scan testbed it reported Terraform,
+Dockerfile, Kubernetes and CloudFormation findings. It has no checks for GitHub workflow YAML: a
+workflow is read but produces no findings.
