@@ -63,7 +63,9 @@ inputs:
     required: false
     default: "false"
   dry-run:
-    description: Scan and report what would be sent, upload nothing.
+    description: >-
+      Scan and report what would be sent, upload nothing. Booleans accept true/false, yes/no, 1/0
+      and on/off in any case; anything else is refused.
     required: false
     default: "false"
 
@@ -83,6 +85,12 @@ outputs:
   status:
     description: One of complete, failed, skipped-no-infrastructure.
     value: ${{ steps.scan.outputs.status }}
+  delivery-status:
+    description: >-
+      Did this run deliver its result, in the vocabulary every Visiblaze action uses: `sent`,
+      `dry-run` or `failed`. `status` says whether the SCAN completed; this says whether it reached
+      Visiblaze.
+    value: ${{ steps.scan.outputs.delivery-status }}
 
 runs:
   using: composite
@@ -100,7 +108,13 @@ runs:
         IN_DRY_RUN: ${{ inputs.dry-run }}
         GH_REPOSITORY: ${{ github.repository }}
         GH_REPOSITORY_ID: ${{ github.repository_id }}
-        GH_REF_NAME: ${{ github.ref_name }}
+        # github.ref_name is "5/merge" on a pull_request event, a ref that exists only on GitHub's
+        # side; head_ref is the pull request's real branch and is empty on every other event.
+        GH_REF_NAME: ${{ github.head_ref || github.ref_name }}
+        GH_EVENT: ${{ github.event_name }}
+        # The repository a pull request's head lives in. Differs from GH_REPOSITORY only for a pull
+        # request from a fork, the one case GitHub issues no OIDC token.
+        PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         # The pull request's HEAD, not github.sha: on a pull_request event github.sha is GitHub's
         # synthetic merge commit, a sha the platform never looks up, so an upload filed under it is
         # stored and then read by nothing.
@@ -114,31 +128,73 @@ runs:
       run: |
         set -uo pipefail
 
-        # bail reports and then decides whether to break the build. Every one of OUR failures goes
-        # through here so that fail-on-error governs all of them uniformly; a path that exits
-        # directly is a path that ignores the input the customer set.
+        # ── Booleans, validated ─────────────────────────────────────────────────────────
+        #
+        # Anything not clearly true or false is refused, with exit 1 whatever fail-on-error says:
+        # `dry-run: 'True'` must never fall through to a real upload, and `fail-on-error: 'yes'`
+        # must not quietly mean "no".
+        norm_bool() {
+          case "$(printf '%s' "$2" | tr 'A-Z' 'a-z')" in
+            true|yes|1|on)     printf 'true'  ;;
+            false|no|0|off|"") printf 'false' ;;
+            *) echo "::error::visiblaze-iac: ${1} must be true or false, got '${2}'" >&2
+               printf 'invalid' ;;
+          esac
+        }
+        IN_DRY_RUN="$(norm_bool dry-run "${IN_DRY_RUN:-}")"
+        IN_FAIL_ON_ERROR="$(norm_bool fail-on-error "${IN_FAIL_ON_ERROR:-}")"
+        if [ "$IN_DRY_RUN" = "invalid" ] || [ "$IN_FAIL_ON_ERROR" = "invalid" ]; then
+          printf 'status=failed\ndelivery-status=failed\nfindings=\ndeclarations=\ncomplete=false\n' >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        # bail() is AVAILABILITY: a download that will not download, an ingest that is down or
+        # refuses, no OIDC token. Ours, and governed by fail-on-error, so an outage on our side is
+        # never the reason a pipeline goes red unless the caller asked for that.
         STATUS="failed"
         bail() {
           local level="$1"; shift
           echo "::${level}::visiblaze-iac: $*"
           echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "delivery-status=failed" >> "$GITHUB_OUTPUT"
           printf 'findings=\ndeclarations=\ncomplete=false\n' >> "$GITHUB_OUTPUT"
+          # Once the scan has counted findings at the customer's fail-on bar, OUR failure after
+          # that point (no token, a refused upload) must not switch THEIR gate off: the findings
+          # are real whether or not we stored them. Zero before the scan, so earlier failures
+          # are untouched.
+          if [ "${HIT:-0}" -gt 0 ]; then
+            echo "::error::visiblaze-iac: ${HIT} finding(s) at or above ${IN_FAIL_ON}"
+            exit 2
+          fi
           if [ "${IN_FAIL_ON_ERROR}" = "true" ]; then exit 1; fi
           exit 0
         }
 
-        # ── Booleans, validated ─────────────────────────────────────────────────────────
-        #
-        # An unrecognised value is refused rather than silently read as false. "yes" meaning
-        # "no" is the kind of thing nobody notices until the run that mattered.
-        for v in IN_FAIL_ON_ERROR IN_DRY_RUN; do
-          case "${!v}" in
-            true|false) ;;
-            *) bail error "${v#IN_} must be 'true' or 'false', got '${!v}'" ;;
-          esac
-        done
+        # fatal() is INTEGRITY and CONFIGURATION, and it ignores fail-on-error: a digest or
+        # signature that does not verify, a pin that is missing, an api-url this action may not post
+        # to, a path outside the checkout, an input value nobody can run. None is an outage, and a
+        # green job on any of them is indistinguishable from a clean scan.
+        fatal() {
+          echo "::error::visiblaze-iac: $*"
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          echo "delivery-status=failed" >> "$GITHUB_OUTPUT"
+          printf 'findings=\ndeclarations=\ncomplete=false\n' >> "$GITHUB_OUTPUT"
+          exit 1
+        }
 
-        [ -n "${IN_TENANT}" ] || bail error "tenant is required — a scan filed against no tenant is discarded"
+        [ -n "${IN_TENANT}" ] || fatal "tenant is required — a scan filed against no tenant is discarded"
+
+        # fail-on is checked like the booleans, and for a worse reason: an unrecognised value used
+        # to reach jq as a null threshold, and every finding compares >= null, so "hgih" failed the
+        # job on its first info-level finding.
+        case "${IN_FAIL_ON}" in
+          ""|critical|high|medium|low) ;;
+          *) fatal "fail-on must be one of critical, high, medium, low (or empty), got '${IN_FAIL_ON}'" ;;
+        esac
+        # A Go duration, as the scanner expects. A typo would make the scan fail, and a failed scan
+        # is a bail(), so `timeout: 14` would quietly turn the check off.
+        printf '%s' "${IN_TIMEOUT}" | grep -Eq '^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$' \
+          || fatal "timeout must be a Go duration such as 14m, got '${IN_TIMEOUT}'"
 
         # ── The caller's inputs are checked BEFORE anything is fetched ───────────────────
         #
@@ -153,20 +209,24 @@ runs:
         # ALLOWED_API_ORIGINS the calling job set in its own env, so a workflow cannot widen the
         # allowlist for itself. Whether the file names a release is still asked further down.
         PINS="${ACTION_DIR}/pins.env"
-        [ -f "$PINS" ] || bail error "pins.env is missing from the action — refusing to fetch anything unpinned"
+        [ -f "$PINS" ] || fatal "pins.env is missing from the action — refusing to fetch anything unpinned"
         # shellcheck disable=SC1090
         . "$PINS"
 
         # ── The API origin ──────────────────────────────────────────────────────────────
         if [ "${IN_DRY_RUN}" != "true" ]; then
           if [ -z "${ALLOWED_API_ORIGINS:-}" ]; then
-            bail error "pins.env allows no ingest origin, so this scan cannot be sent. Run with dry-run: true, which scans and reports without sending."
+            fatal "pins.env allows no ingest origin, so this scan cannot be sent. Run with dry-run: true, which scans and reports without sending."
           fi
-          [ -n "${IN_API_URL}" ] || bail error "api-url is required — use the ingest endpoint Visiblaze gave you"
+          [ -n "${IN_API_URL}" ] || fatal "api-url is required — use the ingest endpoint Visiblaze gave you"
+          case "${IN_API_URL}" in
+            https://*) ;;
+            *) fatal "api-url must be https, got '${IN_API_URL}'" ;;
+          esac
           origin="$(printf '%s' "${IN_API_URL}" | sed -E 's#^(https://[^/]+).*#\1#')"
           case " ${ALLOWED_API_ORIGINS} " in
             *" ${origin} "*) ;;
-            *) bail error "api-url origin ${origin} is not one this action is allowed to post to" ;;
+            *) fatal "api-url origin ${origin} is not one this action is allowed to post to" ;;
           esac
         fi
 
@@ -179,14 +239,21 @@ runs:
           || bail error "path '${IN_PATH}' does not exist in the checkout"
         case "${TARGET}" in
           "${WS}"|"${WS}"/*) ;;
-          *) bail error "path '${IN_PATH}' resolves outside the checkout" ;;
+          *) fatal "path '${IN_PATH}' resolves outside the checkout" ;;
         esac
 
         # ── Pins ────────────────────────────────────────────────────────────────────────
         if [ -z "${SCANNER_VERSION:-}" ] || [ -z "${SCANNER_SHA256_LINUX_AMD64:-}" ]; then
-          STATUS="failed"
-          bail error "this action has no pinned scanner release yet, so there is nothing it can verify and run. See pins.env."
+          fatal "this action has no pinned scanner release yet, so there is nothing it can verify and run. See pins.env."
         fi
+        # The release signature is required, not optional: the digest says these are the bytes this
+        # action commit names, the signature says our release workflow built them.
+        [ "${SCANNER_SIGNED:-}" = "true" ] || fatal "pins.env does not require the release signature (SCANNER_SIGNED=${SCANNER_SIGNED:-<unset>}); refusing to run an unsigned scanner"
+        for k in SCANNER_CERT_IDENTITY_REGEXP SCANNER_CERT_OIDC_ISSUER COSIGN_URL_LINUX_AMD64 COSIGN_SHA256_LINUX_AMD64 COSIGN_URL_LINUX_ARM64 COSIGN_SHA256_LINUX_ARM64; do
+          case "$(eval "printf '%s' \"\${${k}:-}\"")" in
+            ''|UNSET) fatal "${k} is not pinned in pins.env — the release signature cannot be checked" ;;
+          esac
+        done
 
         case "$(uname -s)" in
           Linux) ;;
@@ -200,7 +267,21 @@ runs:
 
         # ── Fetch and verify ────────────────────────────────────────────────────────────
         WORK="$(mktemp -d)"
-        trap 'rm -rf "${WORK}"' EXIT
+        chmod 700 "${WORK}"
+        # The cleanup for everything this step leaves in the caller's checkout: the merge-base
+        # worktree (registered in their repository, so removed there, not just its directory) and
+        # the ref fetched for it. A self-hosted runner keeps the checkout between jobs.
+        BASE_WT=""
+        BASE_REF_FETCHED=""
+        cleanup() {
+          if [ -n "${BASE_WT}" ]; then
+            git -C "${WS}" worktree remove --force "${BASE_WT}" >/dev/null 2>&1 || true
+            git -C "${WS}" worktree prune >/dev/null 2>&1 || true
+          fi
+          [ -z "${BASE_REF_FETCHED}" ] || git -C "${WS}" update-ref -d refs/visiblaze/base >/dev/null 2>&1 || true
+          rm -rf "${WORK}"
+        }
+        trap cleanup EXIT
 
         verify() {
           local file="$1" want="$2" actual
@@ -209,9 +290,10 @@ runs:
           elif command -v shasum >/dev/null 2>&1; then
             actual="$(shasum -a 256 "$file" | awk '{print $1}')"
           else
-            bail error "no sha256sum or shasum on this runner — cannot verify a download, so nothing will be executed"
+            fatal "no sha256sum or shasum on this runner — cannot verify a download, so nothing will be executed"
           fi
-          [ "$actual" = "$want" ] || bail error "digest mismatch on $(basename "$file"): expected ${want}, got ${actual}. Nothing was executed."
+          [ "$(printf '%s' "$actual" | tr 'A-Z' 'a-z')" = "$(printf '%s' "$want" | tr 'A-Z' 'a-z')" ] \
+            || fatal "digest mismatch on $(basename "$file"): expected ${want}, got ${actual}. Nothing was executed. Either the pin is stale or the artefact changed; do not 'fix' this by updating the digest without finding out which."
         }
 
         # ONE artefact, ONE digest. Trivy and its Rego checks ship inside our release bundle
@@ -224,11 +306,11 @@ runs:
         # what every other consumer of the binary wants; this action refused it at the engine check
         # below (v0.1.1 measured: one file, no trivy, no checks).
         case "$(uname -m)" in
-          x86_64)  ARCH=amd64; SCANNER_WANT="${SCANNER_SHA256_LINUX_AMD64}" ;;
-          aarch64) ARCH=arm64; SCANNER_WANT="${SCANNER_SHA256_LINUX_ARM64}" ;;
+          x86_64|amd64)  ARCH=amd64; SCANNER_WANT="${SCANNER_SHA256_LINUX_AMD64}"; COSIGN_URL="${COSIGN_URL_LINUX_AMD64}"; COSIGN_WANT="${COSIGN_SHA256_LINUX_AMD64}" ;;
+          aarch64|arm64) ARCH=arm64; SCANNER_WANT="${SCANNER_SHA256_LINUX_ARM64:-}"; COSIGN_URL="${COSIGN_URL_LINUX_ARM64}"; COSIGN_WANT="${COSIGN_SHA256_LINUX_ARM64}" ;;
           *) bail error "unsupported runner architecture $(uname -m)" ;;
         esac
-        [ -n "${SCANNER_WANT}" ] || bail error "pins.env names no digest for linux/${ARCH}, so nothing can be verified and run"
+        [ -n "${SCANNER_WANT}" ] || fatal "pins.env names no digest for linux/${ARCH}, so nothing can be verified and run"
 
         BUNDLE="${WORK}/bundle"
         mkdir -p "${BUNDLE}"
@@ -236,13 +318,33 @@ runs:
         curl -fsSL --retry 3 -o "${WORK}/${TGZ}" "${SCANNER_BASE_URL}/${SCANNER_VERSION}/${TGZ}" \
           || bail error "could not download ${TGZ}"
         verify "${WORK}/${TGZ}" "${SCANNER_WANT}"
+
+        # Provenance on top of the digest: the bundle's Sigstore signature, checked with a pinned
+        # cosign against our release workflow's identity. Keyless verification reads Sigstore's
+        # trust root; a runner behind a TLS-intercepting proxy must let sigstore.dev through. Never
+        # skipped.
+        curl -fsSL --retry 3 -o "${WORK}/cosign" "${COSIGN_URL}" \
+          || bail error "could not download cosign — the release signature cannot be checked, so nothing will be executed"
+        verify "${WORK}/cosign" "${COSIGN_WANT}"
+        chmod +x "${WORK}/cosign"
+        curl -fsSL --retry 3 -o "${WORK}/${TGZ}.sigstore.json" "${SCANNER_BASE_URL}/${SCANNER_VERSION}/${TGZ}.sigstore.json" \
+          || bail error "could not download the signature bundle for ${TGZ} — refusing to run an unverified scanner"
+        if ! "${WORK}/cosign" verify-blob --bundle "${WORK}/${TGZ}.sigstore.json" \
+              --certificate-identity-regexp "${SCANNER_CERT_IDENTITY_REGEXP}" \
+              --certificate-oidc-issuer "${SCANNER_CERT_OIDC_ISSUER}" \
+              "${WORK}/${TGZ}" >/dev/null 2>"${WORK}/cosign.err"; then
+          fatal "signature verification FAILED for ${TGZ}: the digest matched but it was not signed by the Visiblaze release workflow (${SCANNER_CERT_IDENTITY_REGEXP}) — $(tail -1 "${WORK}/cosign.err"). Do not proceed by relaxing this check."
+        fi
+        echo "visiblaze-iac: scanner signature verified (Visiblaze release workflow)"
+
         tar -xzf "${WORK}/${TGZ}" -C "${BUNDLE}" || bail error "could not extract ${TGZ}"
 
         # The Rego checks travel with the release, so a scan never depends on a registry being up.
-        [ -x "${BUNDLE}/visiblaze-iac" ] || bail error "the release carried no visiblaze-iac binary; nothing was executed"
-        [ -x "${BUNDLE}/trivy" ] || bail error "the release carried no scanner engine; nothing was executed"
+        # A verified bundle missing any of the three is a broken release, not an outage.
+        [ -x "${BUNDLE}/visiblaze-iac" ] || fatal "the release carried no visiblaze-iac binary; nothing was executed"
+        [ -x "${BUNDLE}/trivy" ] || fatal "the release carried no scanner engine; nothing was executed"
         CHECKS_DIR="${BUNDLE}/checks"
-        [ -d "${CHECKS_DIR}/policy" ] || bail error "the release carried no checks bundle; a scan with no checks reports nothing and would look clean"
+        [ -d "${CHECKS_DIR}/policy" ] || fatal "the release carried no checks bundle; a scan with no checks reports nothing and would look clean"
 
         # ── The merge base, on a pull request ───────────────────────────────────────────
         #
@@ -262,8 +364,9 @@ runs:
         REL="${TARGET#"${WS}"}"
         REL="${REL#/}"
         BASE_COMMIT=""
-        BASE_WT="${WORK}/base"
         if [ -n "${BASE_SHA:-}" ] && [ "${IN_DRY_RUN}" != "true" ] && git -C "${WS}" rev-parse --git-dir >/dev/null 2>&1; then
+          BASE_WT="${WORK}/base"
+          BASE_REF_FETCHED="yes"
           git -C "${WS}" fetch --no-tags --quiet --depth=200 origin "+${BASE_SHA}:refs/visiblaze/base" 2>/dev/null \
             || git -C "${WS}" fetch --no-tags --quiet --depth=200 origin "${BASE_REF}" 2>/dev/null || true
           git -C "${WS}" fetch --no-tags --quiet --deepen=200 2>/dev/null || true
@@ -274,9 +377,6 @@ runs:
           if [ -n "${MERGE_BASE}" ] \
              && git -C "${WS}" worktree add --detach --quiet "${BASE_WT}" "${MERGE_BASE}" 2>/dev/null; then
             BASE_COMMIT="${MERGE_BASE}"
-            # The worktree is registered in the caller's repository; remove it there, not just its
-            # directory, or the checkout is left naming a path that no longer exists.
-            trap 'git -C "${WS}" worktree remove --force "${BASE_WT}" 2>/dev/null; rm -rf "${WORK}"' EXIT
             echo "visiblaze-iac: comparing against merge base ${MERGE_BASE}"
           else
             echo "::warning::visiblaze-iac: could not resolve the merge base of ${MB_HEAD} and ${BASE_SHA}; sending the head only, so this pull request's check will report no baseline"
@@ -352,27 +452,70 @@ runs:
           jq -r '.notes // [] | .[] | "- \(.)"' "${PAYLOAD}"
         } >> "$GITHUB_STEP_SUMMARY"
 
+        # ── Your result, not ours ───────────────────────────────────────────────────────
+        #
+        # fail-on is the customer's policy and is reported as-is, regardless of fail-on-error,
+        # which governs only whether OUR failures break the build. Counted here, once, on the
+        # head scan, and enforced on every path that follows: a dry run (which used to exit
+        # before reaching it, so a policy being trialled in dry-run never fired), a sent scan,
+        # and any failure of ours after this point -- bail checks HIT, because a refused upload
+        # used to bail first, so an outage on our side switched the customer's own gate off.
+        HIT=0
+        if [ -n "${IN_FAIL_ON}" ]; then
+          HIT=$(jq --arg t "${IN_FAIL_ON}" '
+            ["low","medium","high","critical"] as $rank
+            | ($rank | index($t)) as $ti
+            | [.findings[] | (.severity // "" | ascii_downcase) as $s
+                | select(($rank | index($s)) != null and ($rank | index($s)) >= $ti)] | length' "${PAYLOAD}") \
+            || bail error "could not evaluate fail-on against the scan payload"
+        fi
+        enforce_fail_on() {
+          if [ "${HIT}" -gt 0 ]; then
+            echo "::error::visiblaze-iac: ${HIT} finding(s) at or above ${IN_FAIL_ON}"
+            exit 2
+          fi
+        }
+
         if [ "${IN_DRY_RUN}" = "true" ]; then
+          echo "delivery-status=dry-run" >> "$GITHUB_OUTPUT"
           echo "::notice::visiblaze-iac: dry run — ${N_FIND} finding(s), ${N_DECL} resource(s) located, nothing sent"
           jq -r '.findings[0:5][] | "  \(.severity)  \(.rule_id)  \(.path):\(.start_line)"' "${PAYLOAD}"
+          enforce_fail_on
           exit 0
         fi
 
         # ── Send ────────────────────────────────────────────────────────────────────────
+        #
+        # A pull request from a FORK gets no OIDC token, whatever the workflow asks for. It was
+        # scanned and its fail-on is enforced below; nothing is sent, and that is said, not failed.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ "${GH_EVENT:-}" = "pull_request" ] \
+           && [ -n "${PR_HEAD_REPO:-}" ] && [ "${PR_HEAD_REPO}" != "${GH_REPOSITORY:-}" ]; then
+          echo "::warning::visiblaze-iac: this pull request comes from a fork (${PR_HEAD_REPO}), and GitHub issues no OIDC token to fork pull requests. Scanned on this runner and fail-on enforced; nothing was sent to Visiblaze."
+          echo "delivery-status=failed" >> "$GITHUB_OUTPUT"
+          enforce_fail_on
+          exit 0
+        fi
         if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
           bail error "no OIDC token available — add 'permissions: { id-token: write }' to this job"
         fi
         AUDIENCE="visiblaze-iac-findings"
-        OIDC=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+        # Both bearer values reach curl through --config on a file in the 0700 work directory,
+        # written by printf (a builtin, so on no argv). argv is readable by every user on the machine,
+        # and a self-hosted runner is a shared one.
+        ( umask 077; printf 'header = "Authorization: bearer %s"\n' "${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" > "${WORK}/mint.cfg" )
+        OIDC=$(curl -sS --config "${WORK}/mint.cfg" \
           "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" 2>/dev/null | jq -r '.value // empty')
+        rm -f "${WORK}/mint.cfg"
         [ -n "${OIDC}" ] || bail error "could not mint an OIDC token for ${AUDIENCE}"
+        echo "::add-mask::${OIDC}"
+        ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "${OIDC}" > "${WORK}/upload.cfg" )
 
         send() { # payload label
           local body="${WORK}/response-$2.json" code
           gzip -c "$1" > "${WORK}/payload-$2.gz"
           code=$(curl -sS -o "${body}" -w '%{http_code}' \
+            --config "${WORK}/upload.cfg" \
             -X POST "${IN_API_URL}" \
-            -H "Authorization: Bearer ${OIDC}" \
             -H "Content-Type: application/json" \
             -H "Content-Encoding: gzip" \
             -H "x-visiblaze-tenant: ${IN_TENANT}" \
@@ -386,17 +529,7 @@ runs:
         # the one that should find both sides already stored.
         [ -z "${BASE_COMMIT}" ] || send "${BASE_PAYLOAD}" "merge-base"
         send "${PAYLOAD}" "head"
+        rm -f "${WORK}/upload.cfg"
+        echo "delivery-status=sent" >> "$GITHUB_OUTPUT"
 
-        # ── Your result, not ours ───────────────────────────────────────────────────────
-        #
-        # fail-on is the customer's policy and is reported as-is, regardless of fail-on-error,
-        # which governs only whether OUR failures break the build.
-        if [ -n "${IN_FAIL_ON}" ]; then
-          HIT=$(jq --arg t "${IN_FAIL_ON}" '
-            (["low","medium","high","critical"] | index($t)) as $ti
-            | [.findings[] | select((["low","medium","high","critical"] | index(.severity)) >= $ti)] | length' "${PAYLOAD}")
-          if [ "${HIT}" -gt 0 ]; then
-            echo "::error::visiblaze-iac: ${HIT} finding(s) at or above ${IN_FAIL_ON}"
-            exit 2
-          fi
-        fi
+        enforce_fail_on

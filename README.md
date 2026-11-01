@@ -63,8 +63,18 @@ default is 14 minutes for that reason.
 
 One artefact, one digest, one URL. The scanner, the Trivy engine and its policy bundle ship
 together and are verified against a digest committed in `pins.env` before anything is executed. A
-substituted artefact fails the check rather than running. Nothing is fetched from a registry at
-scan time, so a registry outage cannot silently turn a scan into a no-op.
+substituted artefact fails the check rather than running. The bundle's Sigstore signature is also
+checked, with a cosign pinned the same way, against the Visiblaze release workflow's identity, so a
+digest recorded in error still cannot point at bytes we never released. Nothing is fetched from a
+registry at scan time, so a registry outage cannot silently turn a scan into a no-op.
+
+A digest or signature that does not verify, an `api-url` this action may not post to, a `path`
+outside the checkout, or an input value it cannot read (a boolean, `fail-on` or `timeout`) **fails
+the job**, whatever `fail-on-error` says. `fail-on-error` governs only our availability: a download
+or an upload that did not happen. Booleans accept `true`/`false`, `yes`/`no`, `1`/`0` and `on`/`off`.
+
+The OIDC tokens are handed to `curl` in a private config file, never on its command line, so
+another user on a shared self-hosted runner cannot read them from the process list.
 
 ## Pull requests
 
@@ -72,11 +82,25 @@ On a `pull_request` event the action scans two trees: the pull request's head an
 of (base tip, head). It uploads both, merge base first, because the platform's pull-request check
 compares the two by exact commit. Without the merge base it would have nothing to compare against.
 The checkout can stay shallow, because the action deepens it itself. If no merge base can be
-resolved, the head is still sent and the check reports that it had no baseline.
+resolved, the head is still sent and the check reports that it had no baseline. The merge-base
+worktree and the ref fetched for it are removed when the step ends.
+
+A pull request from a **fork** gets no OIDC token from GitHub. The action still scans it and
+enforces `fail-on` (exit 2), sends nothing, says so in a warning and reports
+`delivery-status: failed`; it does not fail the job for the missing upload, even with
+`fail-on-error: true`, because the contributor cannot grant the permission.
 
 ## What it reads, measured
 
 The engine is Trivy's `config` scanner plus Visiblaze's own checks, so it covers every
 infrastructure format Trivy reads. On the Visiblaze scan testbed it reported Terraform,
-Dockerfile, Kubernetes and CloudFormation findings. It has no checks for GitHub workflow YAML: a
-workflow is read but produces no findings.
+Dockerfile, Kubernetes and CloudFormation findings.
+
+GitHub Actions workflows under `.github/workflows/` are checked by Visiblaze's own rules, which
+Trivy does not have:
+
+| Rule | Severity | What it finds |
+|---|---|---|
+| VSC-GHA-WFL-001 | high | `permissions: write-all` on a workflow or a job |
+| VSC-GHA-WFL-002 | high | an issue/PR title or body, comment, branch name or commit message interpolated into a `run:` or `github-script` script |
+| VSC-GHA-WFL-003 | critical | a `pull_request_target` workflow checking out the pull request's own code |
