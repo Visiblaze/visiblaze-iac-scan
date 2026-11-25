@@ -69,26 +69,6 @@ inputs:
     required: false
     default: "false"
 
-  plan-json:
-    description: >-
-      Plan gate. Path to `terraform show -json <planfile>` output. When set, the action does NOT scan
-      the repository: it sends this plan to Visiblaze, which judges it by the repository's change
-      and IaC policies (with no policy written, critical and high findings fail), and fails the
-      job on a failing plan before anything is applied. The plan leaves the runner; review what
-      your plan contains before you turn this on.
-    required: false
-    default: ""
-  workspace:
-    description: Plan gate. A label for the root module or environment the plan is for ("prod", "network/dev").
-    required: false
-    default: ""
-  enforcement:
-    description: >-
-      Plan gate. mandatory (default) fails the job on a failing plan; advisory reports it and lets
-      the job continue.
-    required: false
-    default: "mandatory"
-
 outputs:
   findings:
     description: Number of findings in the payload.
@@ -105,12 +85,6 @@ outputs:
   status:
     description: One of complete, failed, skipped-no-infrastructure.
     value: ${{ steps.scan.outputs.status }}
-  decision:
-    description: Plan gate. pass or fail; empty when no plan was checked.
-    value: ${{ steps.plan.outputs.decision }}
-  blocking:
-    description: Plan gate. Number of findings in the plan that block it.
-    value: ${{ steps.plan.outputs.blocking }}
   delivery-status:
     description: >-
       Did this run deliver its result, in the vocabulary every Visiblaze action uses: `sent`,
@@ -122,7 +96,6 @@ runs:
   using: composite
   steps:
     - id: scan
-      if: inputs.plan-json == ''
       shell: bash
       env:
         IN_TENANT: ${{ inputs.tenant }}
@@ -415,6 +388,10 @@ runs:
         # No `set -e` from here on. Everything below either goes through bail, so fail-on-error
         # decides, or is the customer's own fail-on result. An unchecked non-zero exit would
         # bypass both and fail the customer's job for a reason they did not opt into.
+        #
+        # Made explicit: `shell: bash` runs this as `bash -eo pipefail`, so errexit was still on
+        # and a failed scan below ended the step at `rc=$?`, before bail (SCRUM-17391).
+        set +e
         scan_tree() { # root commit out
           local root="$1" commit="$2" out="$3" path="$1" rc
           [ -z "${REL}" ] || path="$1/${REL}"
@@ -560,138 +537,3 @@ runs:
         echo "delivery-status=sent" >> "$GITHUB_OUTPUT"
 
         enforce_fail_on
-
-    # ── Plan gate ──────────────────────────────────────────────────────────────────────
-    #
-    # Sends one `terraform show -json` plan and acts on the verdict. Separate from the scan step:
-    # it downloads no scanner, reads no repository, and its only output is a pass or a fail.
-    - id: plan
-      if: inputs.plan-json != ''
-      shell: bash
-      env:
-        IN_TENANT: ${{ inputs.tenant }}
-        IN_API_URL: ${{ inputs.api-url }}
-        IN_PLAN: ${{ inputs.plan-json }}
-        IN_WORKSPACE: ${{ inputs.workspace }}
-        IN_ENFORCEMENT: ${{ inputs.enforcement }}
-        IN_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
-        IN_DRY_RUN: ${{ inputs.dry-run }}
-        GH_REF_NAME: ${{ github.head_ref || github.ref_name }}
-        GH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        GH_RUN_ATTEMPT: ${{ github.run_attempt }}
-        ACTION_DIR: ${{ github.action_path }}
-      run: |
-        set -uo pipefail
-        out() { printf '%s\n' "$@" >> "$GITHUB_OUTPUT"; }
-        lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
-        # fatal: configuration the caller must fix. Fails the job whatever fail-on-error says.
-        fatal() { echo "::error::visiblaze-iac plan gate: $*"; out "decision=" "blocking="; exit 1; }
-        # unavailable: OUR failure (no token, endpoint down, plan not evaluated), governed by
-        # fail-on-error exactly as the scan's outages are.
-        unavailable() {
-          echo "::warning::visiblaze-iac plan gate: $*"
-          out "decision=" "blocking="
-          case "$(lower "${IN_FAIL_ON_ERROR}")" in true|yes|1|on) exit 1 ;; esac
-          exit 0
-        }
-
-        [ -n "${IN_TENANT}" ] || fatal "tenant is required"
-        case "$(lower "${IN_ENFORCEMENT}")" in
-          mandatory|"") ENFORCEMENT=mandatory ;;
-          advisory) ENFORCEMENT=advisory ;;
-          *) fatal "enforcement must be mandatory or advisory, got '${IN_ENFORCEMENT}'" ;;
-        esac
-        [ -f "${IN_PLAN}" ] || fatal "plan-json '${IN_PLAN}' is not a file. Create it with: terraform show -json tfplan > plan.json"
-        jq -e '(.format_version | type == "string") and ((.resource_changes // []) | type == "array")' "${IN_PLAN}" >/dev/null 2>&1 \
-          || fatal "plan-json '${IN_PLAN}' is not the output of terraform show -json"
-
-        # Same origin allowlist as the scan: this action never posts where it is merely told to.
-        # shellcheck disable=SC1091
-        . "${ACTION_DIR}/pins.env"
-        if [ "$(lower "${IN_DRY_RUN}")" = "true" ]; then
-          echo "visiblaze-iac plan gate: dry run; $(jq '.resource_changes // [] | length' "${IN_PLAN}") resource change(s) would be checked"
-          out "decision=" "blocking="
-          exit 0
-        fi
-        [ -n "${ALLOWED_API_ORIGINS:-}" ] || fatal "pins.env allows no ingest origin"
-        case "${IN_API_URL}" in https://*) ;; *) fatal "api-url must be https, got '${IN_API_URL}'" ;; esac
-        origin="$(printf '%s' "${IN_API_URL}" | sed -E 's#^(https://[^/]+).*#\1#')"
-        case " ${ALLOWED_API_ORIGINS} " in
-          *" ${origin} "*) ;;
-          *) fatal "api-url origin ${origin} is not one this action is allowed to post to" ;;
-        esac
-        URL="${origin}/v1/code/iac/plan-check"
-
-        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
-          unavailable "no OIDC token available. Add 'permissions: { id-token: write }' to this job"
-        fi
-        # The IaC findings audience: a pipeline allowed to report this repository's
-        # misconfigurations may ask whether a plan passes, and no other token may.
-        OIDC=$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=visiblaze-iac-findings" 2>/dev/null | jq -r '.value // empty')
-        [ -n "${OIDC}" ] || unavailable "could not obtain an OIDC token"
-
-        WORK="$(mktemp -d)"
-        trap 'rm -rf "${WORK}"' EXIT
-        gzip -c "${IN_PLAN}" > "${WORK}/plan.json.gz"
-        umask 077
-        printf '%s\n' "Authorization: Bearer ${OIDC}" "X-Visiblaze-Tenant: ${IN_TENANT}" \
-          "X-Visiblaze-Workspace: ${IN_WORKSPACE}" "X-Visiblaze-Enforcement: ${ENFORCEMENT}" \
-          "X-Visiblaze-Branch: ${GH_REF_NAME}" "X-Visiblaze-Commit: ${GH_SHA}" \
-          "X-Visiblaze-Attempt: ${GH_RUN_ATTEMPT}" > "${WORK}/headers"
-
-        # A repeated POST of the same run, attempt and workspace answers the first verdict, so a
-        # pending answer (the check is still running) is polled by posting again.
-        code=000
-        for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-          code=$(curl -sS -o "${WORK}/verdict.json" -w '%{http_code}' --max-time 35 -X POST "${URL}" \
-            -H @"${WORK}/headers" -H "Content-Type: application/octet-stream" -H "Content-Encoding: gzip" \
-            --data-binary @"${WORK}/plan.json.gz") || code=000
-          if [ "${code}" = 200 ] && ! jq -e '.pending == true' "${WORK}/verdict.json" >/dev/null 2>&1; then break; fi
-          case "${code}" in 401|403|404|409|413) break ;; esac
-          sleep 10
-        done
-        reason() { jq -r '.message // .error // empty' "${WORK}/verdict.json" 2>/dev/null; }
-        case "${code}" in
-          200) ;;
-          401|403) fatal "Visiblaze refused this pipeline (HTTP ${code}). Allow it with IaC findings in Settings > Pipeline access. $(reason)" ;;
-          409) fatal "$(reason)" ;;
-          413) fatal "this plan is larger than Visiblaze accepts" ;;
-          *) unavailable "Visiblaze could not be reached (HTTP ${code}). $(reason)" ;;
-        esac
-        if jq -e '.pending == true' "${WORK}/verdict.json" >/dev/null 2>&1; then
-          unavailable "Visiblaze did not finish checking this plan in time"
-        fi
-
-        DECISION=$(jq -r '.decision' "${WORK}/verdict.json")
-        BLOCKING=$(jq -r '.blocking // 0' "${WORK}/verdict.json")
-        MESSAGE=$(jq -r '.message // ""' "${WORK}/verdict.json")
-        LINK=$(jq -r '.url // ""' "${WORK}/verdict.json")
-        out "decision=${DECISION}" "blocking=${BLOCKING}"
-        {
-          echo "### Visiblaze plan check${IN_WORKSPACE:+: ${IN_WORKSPACE}}"
-          echo ""
-          echo "**${DECISION}** (${ENFORCEMENT}). ${MESSAGE}"
-          if [ "$(jq '.findings // [] | length' "${WORK}/verdict.json")" -gt 0 ]; then
-            echo ""
-            echo "| Decision | Severity | Rule | Resource | Title |"
-            echo "|---|---|---|---|---|"
-            jq -r '.findings[] | "| \(.decision) | \(.severity) | `\(.rule_id)` | `\(.resource // "")` | \(.title // "") |"' "${WORK}/verdict.json"
-          fi
-          if [ -n "${LINK}" ]; then
-            echo ""
-            echo "[Open in Visiblaze](${LINK})"
-          fi
-        } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-        echo "visiblaze-iac plan gate: ${DECISION}. ${MESSAGE}"
-
-        if [ "$(jq -r '.evaluated' "${WORK}/verdict.json")" != "true" ]; then
-          unavailable "the plan was not evaluated: ${MESSAGE}"
-        fi
-        if [ "${DECISION}" = "fail" ]; then
-          if [ "${ENFORCEMENT}" = "mandatory" ]; then
-            echo "::error::visiblaze-iac plan gate: ${BLOCKING} blocking finding(s). ${MESSAGE}"
-            exit 2
-          fi
-          echo "::warning::visiblaze-iac plan gate (advisory): ${BLOCKING} blocking finding(s). ${MESSAGE}"
-        fi

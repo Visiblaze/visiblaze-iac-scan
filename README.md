@@ -76,42 +76,6 @@ or an upload that did not happen. Booleans accept `true`/`false`, `yes`/`no`, `1
 The OIDC tokens are handed to `curl` in a private config file, never on its command line, so
 another user on a shared self-hosted runner cannot read them from the process list.
 
-## Plan gate: block a Terraform plan before it applies
-
-Set `plan-json` and the action checks a plan instead of scanning the repository. Visiblaze judges
-it the same way it judges HCP Terraform and Spacelift plans: by the repository's change policy and
-IaC policy, with your exceptions applied. With no policy written, critical and high findings fail.
-
-```yaml
-permissions:
-  id-token: write   # the plan gate authenticates with this job's OIDC token
-  contents: read
-
-steps:
-  - uses: actions/checkout@v4
-  - uses: hashicorp/setup-terraform@v3
-  - run: terraform init && terraform plan -out tfplan
-  - run: terraform show -json tfplan > plan.json
-  - uses: Visiblaze/visiblaze-iac-scan@<pinned sha>
-    with:
-      tenant: <your tenant id>
-      api-url: <the ingest endpoint Visiblaze gave you>
-      plan-json: plan.json
-      workspace: prod          # a label for this root module or environment
-      enforcement: mandatory   # or advisory: report, never fail the job
-  - run: terraform apply tfplan
-```
-
-- **What leaves your runner:** the plan JSON. Unlike the scan, a plan carries planned values, so
-  review what yours contains before you turn this on.
-- **Who may ask:** a pipeline already allowed to report this repository's IaC findings in
-  Settings > Pipeline access. Nothing new to grant.
-- **Which policy:** the repository is taken from the job's signed token, never from an input, so a
-  pipeline cannot pick a more lenient policy.
-- **Outputs:** `decision` (`pass` or `fail`) and `blocking`. The job summary lists the findings and
-  links to the run in Visiblaze.
-- **When Visiblaze cannot answer:** `fail-on-error` decides, as it does for the scan.
-
 ## Pull requests
 
 On a `pull_request` event the action scans two trees: the pull request's head and the merge base
@@ -140,3 +104,4 @@ Trivy does not have:
 | VSC-GHA-WFL-001 | high | `permissions: write-all` on a workflow or a job |
 | VSC-GHA-WFL-002 | high | an issue/PR title or body, comment, branch name or commit message interpolated into a `run:` or `github-script` script |
 | VSC-GHA-WFL-003 | critical | a `pull_request_target` workflow checking out the pull request's own code |
+| VSC-GHA-WFL-004 | medium | a third-party Action pinned to a tag or branch instead of a full commit SHA |
